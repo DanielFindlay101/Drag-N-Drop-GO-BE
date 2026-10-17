@@ -4,6 +4,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -31,9 +32,13 @@ type createTaskRequest struct {
 	Colour      string `json:"colour"`
 }
 
+type Tag struct {
+	Title string `json:"tag"`
+}
+
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 
-	// Decode the json body
+	// Decode the json body of the request
 	var req createTaskRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -106,6 +111,43 @@ func (s *Server) fetchAllTasks(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	if err := json.NewEncoder(w).Encode(tasks); err != nil {
-		log.Println("create task: encode response:", err)
+		log.Println("cannot fetch tasks: encode response:", err)
 	}
+}
+
+func (s *Server) fetchAllTags(w http.ResponseWriter, r *http.Request){
+	// Create the query
+	rows, err := s.db.Query(`SELECT tag FROM tasks`)
+
+	if err != nil {
+		fmt.Println("Error fetching the tags", err)
+		return
+	}
+
+	defer rows.Close()
+
+	var tags []Tag
+		for rows.Next(){
+		var t Tag
+		
+		err := rows.Scan(&t.Title)
+
+		if err != nil {
+			log.Println("Error scanning a tag row", err)
+			return
+		}
+		tags = append(tags,t)
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Println(err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	if err := json.NewEncoder(w).Encode(tags); err != nil {
+		log.Println("cannot fetch tags: encode response:", err)
+	}
+
 }

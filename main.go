@@ -29,6 +29,7 @@ func main() {
 	srv := &Server{db: db}
 	http.HandleFunc("GET /tasks", srv.fetchAllTasks)
 	http.HandleFunc("POST /tasks", srv.createTask)
+	http.HandleFunc("GET /tags", srv.fetchAllTags)
 
 
 	fmt.Println("Server is running")

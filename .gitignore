@@ -1,1 +1,22 @@
-go-dnd
+# Build output
+/go-dnd
+/bin/
+
+# Secrets — commit a .env.example instead
+.env
+.env.*
+!.env.example
+
+# Go test and coverage output
+*.test
+*.out
+coverage.html
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Live-reload tools (air)
+tmp/

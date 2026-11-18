@@ -3,8 +3,9 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -13,16 +14,15 @@ import (
 	"github.com/google/uuid"
 )
 
-
 type Task struct {
-	ID      		string     `json:"id"`
-	Title			string	   `json:"title"`
-	Description 	string 	   `json:"description"`
-	Tag				string	   `json:"tag"`
- 	Colour          string	   `json:"colour"`
-	Completed		bool       `json:"completed"`
-	CreatedAt   	time.Time  `json:"createdAt"`
-	UpdatedAt   	time.Time  `json:"updatedAt"`
+	ID          string    `json:"id"`
+	Title       string    `json:"title"`
+	Description string    `json:"description"`
+	Tag         string    `json:"tag"`
+	Colour      string    `json:"colour"`
+	Completed   bool      `json:"completed"`
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
 }
 
 type createTaskRequest struct {
@@ -32,11 +32,36 @@ type createTaskRequest struct {
 	Colour      string `json:"colour"`
 }
 
-type Tag struct {
-	Title string `json:"tag"`
+// Pointer fields tell "not sent" (nil) apart from "sent as false / empty".
+type updateTaskRequest struct {
+	Title       *string `json:"title"`
+	Description *string `json:"description"`
+	Tag         *string `json:"tag"`
+	Colour      *string `json:"colour"`
+	Completed   *bool   `json:"completed"`
+}
+
+var allowedColours = map[string]bool{
+	"green": true, "blue": true, "red": true, "yellow": true, "indigo": true,
+}
+
+const taskColumns = "id, title, description, tag, colour, completed, createdAt, updatedAt"
+
+// getTask is shared by createTask and updateTask.
+func (s *Server) getTask(id, userID string) (Task, error) {
+	var t Task
+	err := s.db.QueryRow(
+		"SELECT "+taskColumns+" FROM tasks WHERE id = ? AND userId = ?", id, userID,
+	).Scan(&t.ID, &t.Title, &t.Description, &t.Tag, &t.Colour, &t.Completed, &t.CreatedAt, &t.UpdatedAt)
+	return t, err
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
+	userID, ok := userIDFromContext(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 
 	// Decode the json body of the request
 	var req createTaskRequest
@@ -45,109 +70,213 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// check that the title isn't empty
-	if strings.TrimSpace(req.Title) == "" {
-		http.Error(w, "title is required", http.StatusBadRequest)
+	// Validate against the column limits in schema.sql
+	title := strings.TrimSpace(req.Title)
+	switch {
+	case title == "" || len(title) > 255:
+		http.Error(w, "title must be 1–255 characters", http.StatusBadRequest)
+		return
+	case len(req.Description) > 500:
+		http.Error(w, "description must be at most 500 characters", http.StatusBadRequest)
+		return
+	case len(req.Tag) > 50:
+		http.Error(w, "tag must be at most 50 characters", http.StatusBadRequest)
+		return
+	case !allowedColours[req.Colour]:
+		http.Error(w, "unknown colour", http.StatusBadRequest)
 		return
 	}
 
-
-	// Generate the id of the task 
+	// Generate the id of the task
 	id := uuid.NewString()
 	_, err := s.db.Exec(
-		"INSERT INTO tasks (id, title, description, tag, colour) VALUES (?, ?, ?, ?, ?)",
-		id, req.Title, req.Description, req.Tag, req.Colour);
+		"INSERT INTO tasks (id, title, description, tag, colour, userId) VALUES (?, ?, ?, ?, ?, ?)",
+		id, title, req.Description, req.Tag, req.Colour, userID,
+	)
 	if err != nil {
 		log.Println("create task: insert:", err)
-		return
-	}
-
-	// Return the created REST response
-	var t Task
-	err = s.db.QueryRow(
-		" SELECT id, title, description, tag, colour, completed, createdAt, updatedAt FROM tasks WHERE id = ?",
-		id,
-	).Scan(&t.ID, &t.Title, &t.Description, &t.Tag, &t.Colour, &t.Completed, &t.CreatedAt, &t.UpdatedAt)
-	 if err != nil {
-		log.Println("create task: select", err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
-	 }
-
-	// Finally respond with the 201
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(t); err != nil {
-		log.Println("create task: encode response:", err)
 	}
+
+	// Read it back so the response includes completed/createdAt/updatedAt
+	t, err := s.getTask(id, userID)
+	if err != nil {
+		log.Println("create task: select:", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, t)
 }
 
 func (s *Server) fetchAllTasks(w http.ResponseWriter, r *http.Request) {
-	// Create the query
-	rows, err := s.db.Query(`SELECT id, title, description, tag, colour, completed, createdAt, updatedAt FROM tasks`)
+	userID, ok := userIDFromContext(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 
+	// Only fixed SQL fragments are appended; user input stays in placeholders.
+	query := "SELECT " + taskColumns + " FROM tasks WHERE userId = ?"
+	args := []any{userID}
+
+	switch r.URL.Query().Get("completed") {
+	case "true":
+		query += " AND completed = TRUE"
+	case "false":
+		query += " AND completed = FALSE"
+	}
+	query += " ORDER BY createdAt DESC"
+
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
-		log.Println("Error during query", err)
+		log.Println("fetch tasks: query:", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
 
-	var tasks []Task
-	for rows.Next(){
+	// Non-nil so an empty result encodes as [] rather than null
+	tasks := []Task{}
+	for rows.Next() {
 		var t Task
-		
-		err := rows.Scan(&t.ID, &t.Title, &t.Description, &t.Tag, &t.Colour, &t.Completed, &t.CreatedAt, &t.UpdatedAt)
-		if err != nil {
-			log.Println("Error scanning a row", err)
+		if err := rows.Scan(&t.ID, &t.Title, &t.Description, &t.Tag, &t.Colour, &t.Completed, &t.CreatedAt, &t.UpdatedAt); err != nil {
+			log.Println("fetch tasks: scan:", err)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
 		}
 		tasks = append(tasks, t)
 	}
-
 	if err := rows.Err(); err != nil {
-		log.Println(err)
+		log.Println("fetch tasks: rows:", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(tasks); err != nil {
-		log.Println("cannot fetch tasks: encode response:", err)
-	}
+
+	writeJSON(w, http.StatusOK, tasks)
 }
 
-func (s *Server) fetchAllTags(w http.ResponseWriter, r *http.Request){
-	// Create the query
-	rows, err := s.db.Query(`SELECT tag FROM tasks`)
+func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
+	userID, ok := userIDFromContext(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
 
-	if err != nil {
-		fmt.Println("Error fetching the tags", err)
+	var req updateTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
 
-	defer rows.Close()
+	// Build "col = ?" pairs only for the fields that were sent.
+	var sets []string
+	var args []any
+	add := func(col string, v any) {
+		sets = append(sets, col+" = ?")
+		args = append(args, v)
+	}
 
-	var tags []Tag
-		for rows.Next(){
-		var t Tag
-		
-		err := rows.Scan(&t.Title)
-
-		if err != nil {
-			log.Println("Error scanning a tag row", err)
+	if req.Title != nil {
+		title := strings.TrimSpace(*req.Title)
+		if title == "" || len(title) > 255 {
+			http.Error(w, "title must be 1–255 characters", http.StatusBadRequest)
 			return
 		}
-		tags = append(tags,t)
+		add("title", title)
+	}
+	if req.Description != nil {
+		if len(*req.Description) > 500 {
+			http.Error(w, "description must be at most 500 characters", http.StatusBadRequest)
+			return
+		}
+		add("description", *req.Description)
+	}
+	if req.Tag != nil {
+		if len(*req.Tag) > 50 {
+			http.Error(w, "tag must be at most 50 characters", http.StatusBadRequest)
+			return
+		}
+		add("tag", *req.Tag)
+	}
+	if req.Colour != nil {
+		if !allowedColours[*req.Colour] {
+			http.Error(w, "unknown colour", http.StatusBadRequest)
+			return
+		}
+		add("colour", *req.Colour)
+	}
+	if req.Completed != nil {
+		add("completed", *req.Completed)
 	}
 
-	if err := rows.Err(); err != nil {
-		log.Println(err)
+	if len(sets) == 0 {
+		http.Error(w, "no fields provided to update", http.StatusBadRequest)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(tags); err != nil {
-		log.Println("cannot fetch tags: encode response:", err)
+	args = append(args, id, userID)
+	_, err := s.db.Exec(
+		"UPDATE tasks SET "+strings.Join(sets, ", ")+" WHERE id = ? AND userId = ?",
+		args...,
+	)
+	if err != nil {
+		log.Println("update task:", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
 	}
 
+	// Re-read instead of trusting RowsAffected: MySQL reports 0 when the
+	// new values equal the old ones, which isn't a "not found".
+	t, err := s.getTask(id, userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "task not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		log.Println("update task: select:", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, t)
+}
+
+func (s *Server) fetchAllTags(w http.ResponseWriter, r *http.Request) {
+	userID, ok := userIDFromContext(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	rows, err := s.db.Query(
+		"SELECT DISTINCT tag FROM tasks WHERE userId = ? AND tag <> '' ORDER BY tag",
+		userID,
+	)
+	if err != nil {
+		log.Println("fetch tags: query:", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	tags := []string{}
+	for rows.Next() {
+		var tag string
+		if err := rows.Scan(&tag); err != nil {
+			log.Println("fetch tags: scan:", err)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
+		tags = append(tags, tag)
+	}
+	if err := rows.Err(); err != nil {
+		log.Println("fetch tags: rows:", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, tags)
 }
